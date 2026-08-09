@@ -344,45 +344,54 @@ def handler(job):
             print(f"[pano_clean] non-fatal failure, panoramas keep the operator: {e}",
                   flush=True)
 
-        # 5) upload the UNPACKED dataset straight to S3 under scans/<slug>/ so the
-        #    home server stores NOTHING — the tri-viewer streams each file from S3.
+        # 5) upload the dataset to S3 under scans/<slug>/ (+ pano_clean/<slug>/).
         #    Layout the viewer expects:
         #      scans/<slug>/frames/*.jpg          (panoramas)
         #      scans/<slug>/views/*.jpg           (perspective; served as panos/ too)
         #      scans/<slug>/cameras.json, intrinsics.json
         #      scans/<slug>/depth/frame_<i>.npz   (per-view depth)
-        #      scans/<slug>/pointcloud.ply        (for Phase-2 splat training)
+        #      scans/<slug>/pointcloud.ply, pointcloud_downsampled.ply
+        #      pano_clean/<slug>/frames/*.jpg, cameras.json
+        #
+        #    STORAGE_MODE=unpacked (default): every file is its own S3 object, so the
+        #    home server stores NOTHING and the tri-viewer streams each file from S3
+        #    on demand. Thousands of individual PUTs (~206 frames + ~7,400 views + a
+        #    depth file per view is not unusual) means per-request overhead dominates
+        #    and the upload alone can take many minutes.
+        #
+        #    STORAGE_MODE=zip (opt-in, INFRASCAN_STORAGE_MODE=zip): bundle the same
+        #    files into ONE archive, uploaded as a single object (scans/<slug>.zip) —
+        #    one PUT instead of thousands. This is the pre-c9be5ae upload shape,
+        #    reintroduced as a toggle: the home server (GB10) goes back to holding a
+        #    local unpacked copy for serving, so it is no longer storage-free in this
+        #    mode. train/handler.py's _dl_scan() and runpod_worker.py's _finish() both
+        #    auto-detect the zip's presence per scan, so this is fully reversible —
+        #    flip the env var back (or just don't set it) and every consumer falls
+        #    back to the unpacked, storage-free path with no other change needed.
         import storage
         s3c = storage._client()
         bucket = os.environ["S3_BUCKET"]
         prefix = f"scans/{slug}"
+        storage_mode = os.environ.get("INFRASCAN_STORAGE_MODE", "unpacked")
 
-        # Every file goes up one at a time (thousands of them: ~206 frames +
-        # ~7,400 views + a depth file per view is not unusual), with no log
-        # output at all previously — a job could sit here for many minutes
-        # looking identical to a hung one. Report the stage once, then print
-        # periodically so the console shows real, live progress through it.
         _report(job, "upload")
         total_expected = (
             sum(1 for _ in (data_dir / "frames").glob("*") if _.is_file())
             + sum(1 for _ in (data_dir / "views").glob("*") if _.is_file())
         )
-        print(f"[s3] uploading ~{total_expected} frame/view files (plus depth, "
-              f"cameras, pointcloud, cleaned panoramas)...", flush=True)
+        print(f"[s3] {storage_mode} upload of ~{total_expected} frame/view files "
+              f"(plus depth, cameras, pointcloud, cleaned panoramas)...", flush=True)
 
-        def _put(local: Path, key: str):
-            s3c.upload_file(str(local), bucket, key)
-
-        nfiles = 0
+        # Build the full (local_path, S3 key) manifest once; unpacked mode PUTs each
+        # entry individually, zip mode bundles them all into one archive instead.
+        manifest = []
         for sub in ("frames", "views"):
             for p in sorted((data_dir / sub).glob("*")):
                 if p.is_file():
-                    _put(p, f"{prefix}/{sub}/{p.name}"); nfiles += 1
-                    if nfiles % 500 == 0:
-                        print(f"[s3] uploaded {nfiles} files so far...", flush=True)
+                    manifest.append((p, f"{prefix}/{sub}/{p.name}"))
         for f in ("cameras.json", "intrinsics.json", "pointcloud.ply"):
             if (data_dir / f).exists():
-                _put(data_dir / f, f"{prefix}/{f}"); nfiles += 1
+                manifest.append((data_dir / f, f"{prefix}/{f}"))
 
         # downsample_ply (part of pipeline.runner, above) already voxel-downsamples
         # pointcloud.ply for the web topdown viewer — it just never leaves this worker.
@@ -394,13 +403,11 @@ def handler(job):
         # writes to the fixed PLATFORM/ui/_spaces/<slug>/ path, not the per-job run_root.
         downsampled = Path(PLATFORM) / "ui" / "_spaces" / slug / "Data_" / "downsampled_web.ply"
         if downsampled.exists():
-            _put(downsampled, f"{prefix}/pointcloud_downsampled.ply"); nfiles += 1
+            manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
         ro = data_dir / "_da3_streaming" / "results_output"
         if ro.is_dir():
             for npz in sorted(ro.glob("frame_*.npz")):
-                _put(npz, f"{prefix}/depth/{npz.name}"); nfiles += 1
-                if nfiles % 500 == 0:
-                    print(f"[s3] uploaded {nfiles} files so far...", flush=True)
+                manifest.append((npz, f"{prefix}/depth/{npz.name}"))
 
         # operator-removed panoramas (if the pano_clean step produced them). The viewer
         # picks these up when scenes.json has panoClean=true (set by runpod_worker.py):
@@ -409,11 +416,31 @@ def handler(job):
         n_clean = 0
         if pano_clean_dir.is_dir():
             for p in sorted(pano_clean_dir.glob("*.jpg")):
-                _put(p, f"pano_clean/{slug}/frames/{p.name}"); n_clean += 1; nfiles += 1
+                manifest.append((p, f"pano_clean/{slug}/frames/{p.name}")); n_clean += 1
             if n_clean and (data_dir / "cameras.json").exists():
-                _put(data_dir / "cameras.json", f"pano_clean/{slug}/cameras.json"); nfiles += 1
-            print(f"[s3] uploaded {n_clean} cleaned panoramas to "
-                  f"s3://{bucket}/pano_clean/{slug}/", flush=True)
+                manifest.append((data_dir / "cameras.json", f"pano_clean/{slug}/cameras.json"))
+
+        nfiles = 0
+        if storage_mode == "zip":
+            import zipfile
+            zip_path = run_root / f"{slug}.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+                for local, key in manifest:
+                    zf.write(local, arcname=key)
+                    nfiles += 1
+                    if nfiles % 2000 == 0:
+                        print(f"[zip] added {nfiles}/{len(manifest)} files...", flush=True)
+            zip_key = f"scans/{slug}.zip"
+            print(f"[s3] uploading {zip_path.stat().st_size/1e6:.0f}MB archive "
+                  f"({nfiles} files) -> s3://{bucket}/{zip_key} ...", flush=True)
+            s3c.upload_file(str(zip_path), bucket, zip_key)
+            print(f"[s3] uploaded s3://{bucket}/{zip_key}", flush=True)
+        else:
+            for local, key in manifest:
+                s3c.upload_file(str(local), bucket, key)
+                nfiles += 1
+                if nfiles % 500 == 0:
+                    print(f"[s3] uploaded {nfiles} files so far...", flush=True)
 
         n_views = len(glob.glob(str(views / "*.jpg")))
         n_panos = len(glob.glob(str(frames / "*.jpg")))
