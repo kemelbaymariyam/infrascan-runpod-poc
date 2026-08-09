@@ -18,6 +18,26 @@ website/index.html  ──►  RunPod endpoint (this Docker image)  ──►  h
 - `Dockerfile` — python + ffmpeg + opencv + runpod SDK.
 - `website/index.html` — enter endpoint + video URL, see the result.
 
+## Upload mode: `INFRASCAN_STORAGE_MODE`
+Set on this endpoint's own env (RunPod endpoint template, not a per-job input field):
+- `unpacked` (default) — every file in the scan is its own S3 object under `scans/<slug>/`.
+  The home server stays storage-free; the viewer streams each file from S3 on demand.
+  Thousands of individual PUTs on a dense scan means per-request overhead dominates and
+  the upload step alone can take many minutes.
+- `zip` — bundles the whole scan into one `scans/<slug>.zip` object instead (one PUT).
+  Much faster upload, at the cost of the home server needing to unpack it locally to
+  serve it (see `infrascan-onprem`'s README, "Storage mode" section) and the train
+  endpoint downloading+extracting the archive instead of listing individual keys —
+  both auto-detect the archive's presence per scan, no other config needed. Fully
+  reversible: set this back to `unpacked` and every later scan goes back to individual
+  S3 objects.
+
+`handler.py` also uploads `scans/<slug>/pointcloud_downsampled.ply` (the same
+voxel-downsampled cloud `pipeline.runner`'s `downsample_ply` stage already computes for
+the web topdown view) alongside the raw `pointcloud.ply` — the train endpoint prefers it
+for splatfacto's initial Gaussians, since a dense/3-pitch scan's raw cloud can exceed 30M
+points and OOM the GPU before training starts.
+
 ## Note on GPU
 This stage-0 part is **CPU-only** (ffmpeg + OpenCV). You can deploy it on a small/CPU
 worker. GPU is only needed *later* for DA3 depth+poses and splat training.
