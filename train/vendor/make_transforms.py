@@ -51,8 +51,16 @@ def convert(src, out):
     # images: symlink to the existing crops (views/), so nothing is duplicated
     views = src / "views"
     (out / "images").exists() or (out / "images").symlink_to(views)
-    # init pointcloud
-    ply = src / "pointcloud.ply"
+    # init pointcloud — prefer the ingest-side voxel-downsampled cloud (built for the
+    # web topdown view, but just as good an init cloud and orders of magnitude
+    # smaller) over the raw one. A dense/3-pitch scan's raw pointcloud.ply can exceed
+    # 30M points, which splatfacto turns into 30M+ uncapped Gaussians — enough to OOM
+    # the GPU before a single training step runs. Older scans uploaded before this
+    # existed won't have it, so fall back to the raw cloud.
+    ply = src / "pointcloud_downsampled.ply"
+    if not ply.exists():
+        ply = src / "pointcloud.ply"
+    print(f"[convert] init pointcloud: {ply.name}")
     if ply.exists():
         (out / "sparse_pc.ply").exists() or (out / "sparse_pc.ply").symlink_to(ply)
 
