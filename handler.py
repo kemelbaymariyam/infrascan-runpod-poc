@@ -383,6 +383,18 @@ def handler(job):
         for f in ("cameras.json", "intrinsics.json", "pointcloud.ply"):
             if (data_dir / f).exists():
                 _put(data_dir / f, f"{prefix}/{f}"); nfiles += 1
+
+        # downsample_ply (part of pipeline.runner, above) already voxel-downsamples
+        # pointcloud.ply for the web topdown viewer — it just never leaves this worker.
+        # A dense/3-pitch scan's raw pointcloud.ply can be 30M+ points, which is fine
+        # for the topdown view but turns into 30M+ un-capped splatfacto Gaussians on
+        # the train endpoint (OOMs the GPU before a single training step). Upload this
+        # already-computed, already-cheap file too so train can prefer it. NOT anchored
+        # under data_dir — downsample_ply.py (unlike the rest of this pipeline) still
+        # writes to the fixed PLATFORM/ui/_spaces/<slug>/ path, not the per-job run_root.
+        downsampled = Path(PLATFORM) / "ui" / "_spaces" / slug / "Data_" / "downsampled_web.ply"
+        if downsampled.exists():
+            _put(downsampled, f"{prefix}/pointcloud_downsampled.ply"); nfiles += 1
         ro = data_dir / "_da3_streaming" / "results_output"
         if ro.is_dir():
             for npz in sorted(ro.glob("frame_*.npz")):
@@ -428,6 +440,9 @@ def handler(job):
         # freed by re-scanning that same slug. Clean it here so every job nets to ~zero.
         # DA3 weights live OUTSIDE run_root (WORKROOT.parent/da3_weights) and persist.
         shutil.rmtree(run_root, ignore_errors=True)
+        # downsample_ply.py writes outside run_root too (see the upload step above) —
+        # clean it up here for the same net-zero-per-job reason.
+        shutil.rmtree(Path(PLATFORM) / "ui" / "_spaces" / slug, ignore_errors=True)
         _disk_report("job-end")
 
 
