@@ -99,8 +99,45 @@ def _sh(cmd, env=None, cwd=None):
 
 
 def _dl_scan(slug: str, dst: Path):
-    """Download scans/<slug>/ from S3 into a 3d-data-style capture dir."""
+    """Download scans/<slug>/ from S3 into a 3d-data-style capture dir.
+
+    If ingest ran with INFRASCAN_STORAGE_MODE=zip, the whole scan is one archive at
+    scans/<slug>.zip instead of thousands of individual keys — download and extract
+    that (one GET) instead of listing+downloading every key one at a time. Falls
+    back to the per-file loop below for scans uploaded in the default unpacked mode,
+    so this is automatic per-scan and needs no separate config on this endpoint."""
     dst.mkdir(parents=True, exist_ok=True)
+    zip_key = f"scans/{slug}.zip"
+    try:
+        s3.head_object(Bucket=BUCKET, Key=zip_key)
+        has_zip = True
+    except Exception:
+        has_zip = False
+
+    if has_zip:
+        import zipfile, tempfile
+        prefix = f"scans/{slug}/"
+        with tempfile.NamedTemporaryFile(suffix=".zip") as tmp:
+            print(f"[train] downloading archive s3://{BUCKET}/{zip_key} ...", flush=True)
+            s3.download_file(BUCKET, zip_key, tmp.name)
+            n = 0
+            with zipfile.ZipFile(tmp.name) as zf:
+                for info in zf.infolist():
+                    if not info.filename.startswith(prefix):
+                        continue  # skip pano_clean/... entries — train doesn't need them
+                    rel = info.filename[len(prefix):]
+                    if not rel:
+                        continue
+                    target = dst / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as fsrc, open(target, "wb") as fout:
+                        shutil.copyfileobj(fsrc, fout)
+                    n += 1
+        if n == 0:
+            raise RuntimeError(f"archive s3://{BUCKET}/{zip_key} had no {prefix} entries")
+        print(f"[train] extracted {n} files from archive -> {dst}", flush=True)
+        return
+
     prefix = f"scans/{slug}/"
     n = 0
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix):
