@@ -389,12 +389,12 @@ def handler(job):
         #       dense scan) and NEITHER the panorama viewer nor the 3D/scenegraph
         #       overlay ever reads either of them — only training does.
         #
-        #    b) individual S3 objects under scans/<slug>/, pano_clean/<slug>/ and
-        #       pano_lowres/<slug>/ — ONLY what the viewer actually touches: frames
-        #       (raw, kept as the final fallback), pano_clean frames (operator
-        #       removed), pano_lowres frames (operator removed + downsampled,
-        #       default), cameras.json, intrinsics.json. NOT the point cloud, in
-        #       either form — the viewer's minimap uses a splat-derived
+        #    b) individual S3 objects, all nested under scans/<slug>/ alongside frames/,
+        #       splat.ksplat and scene_graph.json — ONLY what the viewer actually
+        #       touches: frames (raw, kept as the final fallback), pano_clean/ frames
+        #       (operator removed), pano_lowres/ frames (operator removed +
+        #       downsampled, default), cameras.json, intrinsics.json. NOT the point
+        #       cloud, in either form — the viewer's minimap uses a splat-derived
         #       floorplan.json or a pure-cameras.json fallback, never a point cloud.
         #       Small (frames are ~200 files, not ~7,400), so individually-addressable
         #       S3 streaming stays fast — no local caching needed anywhere to serve it.
@@ -441,26 +441,30 @@ def handler(job):
         if downsampled.exists():
             train_manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
 
-        # operator-removed panoramas (if the pano_clean step produced them). The viewer
-        # requests pano_clean/<slug>/... , falling back server-side to the raw scan:
-        #   pano_clean/<slug>/frames/*.jpg   cleaned equirect panos the viewer serves
-        #   pano_clean/<slug>/cameras.json   copied so the pano viewer is self-contained
+        # operator-removed panoramas (if the pano_clean step produced them), nested
+        # under scans/<slug>/ alongside frames/, splat.ksplat, scene_graph.json etc. -
+        # this scan's data lives in ONE place, not scattered across sibling top-level
+        # prefixes. Also means a rescan's _archive_s3_prefix(f"scans/{slug}/", ...)
+        # sweep now carries pano_clean/pano_lowres into _history/ automatically, with
+        # no separate archiving call needed for either.
+        #   scans/<slug>/pano_clean/frames/*.jpg   cleaned equirect panos
+        #   scans/<slug>/pano_clean/cameras.json   copied so the pano viewer is self-contained
         n_clean = 0
         if pano_clean_dir.is_dir():
             for p in sorted(pano_clean_dir.glob("*.jpg")):
-                viewer_manifest.append((p, f"pano_clean/{slug}/frames/{p.name}")); n_clean += 1
+                viewer_manifest.append((p, f"{prefix}/pano_clean/frames/{p.name}")); n_clean += 1
             if n_clean and (data_dir / "cameras.json").exists():
-                viewer_manifest.append((data_dir / "cameras.json", f"pano_clean/{slug}/cameras.json"))
+                viewer_manifest.append((data_dir / "cameras.json", f"{prefix}/pano_clean/cameras.json"))
 
-        # low-res panoramas (if the pano_lowres step produced them). Same layout as
-        # pano_clean, under its own prefix -- the viewer requests pano_lowres/<slug>/...
-        # first, falling back server-side to pano_clean/ then raw scans/ if absent.
+        # low-res panoramas (if the pano_lowres step produced them). Same nested shape
+        # as pano_clean above -- the viewer requests pano_lowres first, falling back
+        # server-side to pano_clean then the raw frames if absent.
         n_lowres = 0
         if pano_lowres_dir.is_dir():
             for p in sorted(pano_lowres_dir.glob("*.jpg")):
-                viewer_manifest.append((p, f"pano_lowres/{slug}/frames/{p.name}")); n_lowres += 1
+                viewer_manifest.append((p, f"{prefix}/pano_lowres/frames/{p.name}")); n_lowres += 1
             if n_lowres and (data_dir / "cameras.json").exists():
-                viewer_manifest.append((data_dir / "cameras.json", f"pano_lowres/{slug}/cameras.json"))
+                viewer_manifest.append((data_dir / "cameras.json", f"{prefix}/pano_lowres/cameras.json"))
 
         _report(job, "upload")
         print(f"[s3] building train archive ({len(train_manifest)} files) + "

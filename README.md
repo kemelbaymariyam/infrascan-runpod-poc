@@ -27,13 +27,20 @@ website/index.html  ──►  RunPod endpoint (this Docker image)  ──►  h
   redoing with a better model. Always built — not a mode/toggle, since `views/`+`depth/`
   are the vast majority of a scan's file count (~7,400 of ~7,600 on a dense scan) and
   neither the panorama viewer nor the 3D/scenegraph overlay ever reads either of them.
-- **Individual S3 objects** under `scans/<slug>/`, `pano_clean/<slug>/` and
-  `pano_lowres/<slug>/` — only what the viewer actually touches: panorama frames (raw,
-  operator-removed, operator-removed+downsampled), `cameras.json`, `intrinsics.json`.
+- **Individual S3 objects**, all nested under `scans/<slug>/` alongside `frames/`,
+  `splat.ksplat` and `scene_graph.json` — one scan, one place, instead of scattering
+  related data across sibling top-level prefixes:
+  - `scans/<slug>/frames/` — raw panoramas (kept as the final viewer fallback)
+  - `scans/<slug>/pano_clean/frames/`, `cameras.json` — operator removed, full-res
+  - `scans/<slug>/pano_lowres/frames/`, `cameras.json` — operator removed + downsampled (default)
+  - `scans/<slug>/cameras.json`, `intrinsics.json`
+
   Small (frames are ~200 files, not ~7,400), so the home server can keep streaming this
   set straight from S3 with no local caching at all. Deliberately *not* any point cloud —
   the viewer's minimap uses a splat-derived `floorplan.json` or a pure-`cameras.json`
-  fallback, never a point cloud.
+  fallback, never a point cloud. A re-scan's `scans/<slug>/` → `_history/<scan_id>/`
+  archiving sweep picks up `pano_clean/`+`pano_lowres/` automatically now that they're
+  nested inside it, rather than needing a separate archiving step for each.
 
 `pointcloud_downsampled.ply` (train-only, inside the zip) is the same voxel-downsampled
 cloud `pipeline.runner`'s `downsample_ply` stage already computes — the train endpoint
