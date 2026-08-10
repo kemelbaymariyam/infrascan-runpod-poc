@@ -435,6 +435,11 @@ def handler(job):
         # writes to the fixed PLATFORM/ui/_spaces/<slug>/ path, not the per-job run_root.
         downsampled = Path(PLATFORM) / "ui" / "_spaces" / slug / "Data_" / "downsampled_web.ply"
         if downsampled.exists():
+            # In BOTH manifests: train's _dl_scan() only ever extracts from the zip, so
+            # if this weren't in train_manifest too, make_transforms.py's preference
+            # check would never find it there and would silently fall back to the raw,
+            # uncapped pointcloud.ply - exactly the OOM this file exists to prevent.
+            train_manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
             viewer_manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
 
         # operator-removed panoramas (if the pano_clean step produced them). The viewer
