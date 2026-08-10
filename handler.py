@@ -393,7 +393,9 @@ def handler(job):
         #       pano_lowres/<slug>/ — ONLY what the viewer actually touches: frames
         #       (raw, kept as the final fallback), pano_clean frames (operator
         #       removed), pano_lowres frames (operator removed + downsampled,
-        #       default), cameras.json, intrinsics.json, pointcloud_downsampled.ply.
+        #       default), cameras.json, intrinsics.json. NOT the point cloud, in
+        #       either form — the viewer's minimap uses a splat-derived
+        #       floorplan.json or a pure-cameras.json fallback, never a point cloud.
         #       Small (frames are ~200 files, not ~7,400), so individually-addressable
         #       S3 streaming stays fast — no local caching needed anywhere to serve it.
         import storage
@@ -426,21 +428,18 @@ def handler(job):
                 viewer_manifest.append((data_dir / f, f"{prefix}/{f}"))
 
         # downsample_ply (part of pipeline.runner, above) already voxel-downsamples
-        # pointcloud.ply for the web topdown viewer — it just never leaves this worker.
-        # A dense/3-pitch scan's raw pointcloud.ply can be 30M+ points, which is fine
-        # for the topdown view but turns into 30M+ un-capped splatfacto Gaussians on
-        # the train endpoint (OOMs the GPU before a single training step). Upload this
-        # already-computed, already-cheap file too so train can prefer it. NOT anchored
-        # under data_dir — downsample_ply.py (unlike the rest of this pipeline) still
-        # writes to the fixed PLATFORM/ui/_spaces/<slug>/ path, not the per-job run_root.
+        # pointcloud.ply. Train-ONLY: make_transforms.py prefers this over the raw
+        # pointcloud.ply for splatfacto's initial Gaussians, since a dense/3-pitch
+        # scan's raw cloud can exceed 30M points and OOM the GPU before training
+        # starts. The viewer's minimap does NOT read this - it uses either a
+        # splat-derived floorplan.json or a pure-cameras.json fallback, neither of
+        # which touches any point cloud - so this goes in train_manifest only. NOT
+        # anchored under data_dir - downsample_ply.py (unlike the rest of this
+        # pipeline) still writes to the fixed PLATFORM/ui/_spaces/<slug>/ path, not
+        # the per-job run_root.
         downsampled = Path(PLATFORM) / "ui" / "_spaces" / slug / "Data_" / "downsampled_web.ply"
         if downsampled.exists():
-            # In BOTH manifests: train's _dl_scan() only ever extracts from the zip, so
-            # if this weren't in train_manifest too, make_transforms.py's preference
-            # check would never find it there and would silently fall back to the raw,
-            # uncapped pointcloud.ply - exactly the OOM this file exists to prevent.
             train_manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
-            viewer_manifest.append((downsampled, f"{prefix}/pointcloud_downsampled.ply"))
 
         # operator-removed panoramas (if the pano_clean step produced them). The viewer
         # requests pano_clean/<slug>/... , falling back server-side to the raw scan:

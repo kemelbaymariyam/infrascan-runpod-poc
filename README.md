@@ -29,12 +29,14 @@ website/index.html  ──►  RunPod endpoint (this Docker image)  ──►  h
   neither the panorama viewer nor the 3D/scenegraph overlay ever reads either of them.
 - **Individual S3 objects** under `scans/<slug>/`, `pano_clean/<slug>/` and
   `pano_lowres/<slug>/` — only what the viewer actually touches: panorama frames (raw,
-  operator-removed, operator-removed+downsampled), `cameras.json`, `intrinsics.json`,
-  `pointcloud_downsampled.ply`. Small (frames are ~200 files, not ~7,400), so the home
-  server can keep streaming this set straight from S3 with no local caching at all.
+  operator-removed, operator-removed+downsampled), `cameras.json`, `intrinsics.json`.
+  Small (frames are ~200 files, not ~7,400), so the home server can keep streaming this
+  set straight from S3 with no local caching at all. Deliberately *not* any point cloud —
+  the viewer's minimap uses a splat-derived `floorplan.json` or a pure-`cameras.json`
+  fallback, never a point cloud.
 
-`pointcloud_downsampled.ply` is the same voxel-downsampled cloud `pipeline.runner`'s
-`downsample_ply` stage already computes for the web topdown view — the train endpoint
+`pointcloud_downsampled.ply` (train-only, inside the zip) is the same voxel-downsampled
+cloud `pipeline.runner`'s `downsample_ply` stage already computes — the train endpoint
 prefers it for splatfacto's initial Gaussians, since a dense/3-pitch scan's raw cloud can
 exceed 30M points and OOM the GPU before training starts.
 
