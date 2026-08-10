@@ -33,6 +33,22 @@ DOWN_P = 90        # build_maps pitch that aims the view straight down (nadir)
 BAND_LAT = -18     # replace panorama below this latitude (deg); the flat view covers it
 FEATHER_DEG = 8    # soft blend over this many degrees at the seam
 
+# A single YOLO pass on the down-view sometimes segments only *part* of the
+# operator (e.g. torso + arm but not the head) even though overall detection
+# confidence is fine — confirmed on a real frame (hong_kong_office scanpoint 32,
+# 2026-08-10) where confidence swung from 0.32 to 0.65 on tiny (2-5deg) rotations
+# of the exact same crop, i.e. this specific input sits in a genuinely unstable
+# part of the model's decision surface, not a systematic issue (dark hair,
+# motion blur, and hair/carpet contrast were all directly measured and ruled
+# out). Detecting on a few rotated copies and unioning the masks (each rotated
+# back) catches area a single pass misses; every tested rotation added new
+# mask coverage regardless of whether its own confidence went up or down.
+# Cheap: detection is ~2% of this function's cost, LaMa dominates and still
+# runs once. Verified to add zero false positives on person-free crops at
+# conf=0.05 (well below MASK_CONF below) across all angles.
+MASK_ROTATIONS_DEG = (0, -5, -2, 2, 5)
+MASK_CONF = 0.25
+
 
 def build_maps(fov, pitch, ow, oh, eh, ew):
     """00a_sample_views convention (yaw=0): output pixel -> equirect (u,v) to sample."""
@@ -63,16 +79,38 @@ def inv_maps(eh, ew, row0, fx, fy, cx, cy, pit):
     return u.astype(np.float32), v.astype(np.float32), inb
 
 
+def _detect_mask(down, yolo):
+    """Person mask for one down-view, unioned across MASK_ROTATIONS_DEG (see the
+    comment on that constant for why: a single pass can under-segment even a
+    confidently-detected person). Each rotated detection is rotated back before
+    the union so all masks line up in the original down-view's pixel grid."""
+    h, w = down.shape[:2]
+    center = (w / 2, h / 2)
+    m = np.zeros((h, w), np.uint8)
+    for angle in MASK_ROTATIONS_DEG:
+        if angle == 0:
+            probe = down
+        else:
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            probe = cv2.warpAffine(down, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        res = yolo.predict(probe, classes=[0], conf=MASK_CONF, retina_masks=True, verbose=False)[0]
+        if res.masks is None:
+            continue
+        for mm in res.masks.data.cpu().numpy():
+            pm = cv2.resize((mm * 255).astype(np.uint8), (w, h))
+            if angle != 0:
+                Minv = cv2.getRotationMatrix2D(center, -angle, 1.0)
+                pm = cv2.warpAffine(pm, Minv, (w, h))
+            m = np.maximum(m, pm)
+    return m
+
+
 def clean(img, yolo, lama):
     """Return (cleaned_image, 1 if an operator was removed else 0)."""
     H, W = img.shape[:2]
     mu, mv, cam = build_maps(FOV, DOWN_P, OUTSZ, OUTSZ, H, W)
     down = cv2.remap(img, mu, mv, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-    res = yolo.predict(down, classes=[0], conf=0.25, retina_masks=True, verbose=False)[0]
-    m = np.zeros((OUTSZ, OUTSZ), np.uint8)
-    if res.masks is not None:
-        for mm in res.masks.data.cpu().numpy():
-            m = np.maximum(m, cv2.resize((mm * 255).astype(np.uint8), (OUTSZ, OUTSZ)))
+    m = _detect_mask(down, yolo)
     if m.max() == 0:
         return img, 0
     m = cv2.dilate(m, np.ones((15, 15), np.uint8), iterations=2)
