@@ -7,6 +7,7 @@ this handler drives it headlessly the same way the web app does on upload:
     create space -> place video -> stitch -> frames -> views
         -> 00b_da3_streaming (depth + poses + pointcloud.ply)  [GPU]
         -> pano_clean (operator removal, non-fatal)             [GPU]
+        -> pano_lowres (viewer-size downsample, non-fatal)
     -> upload the unpacked dataset straight to S3 under scans/<slug>/
 
     The object-search stages (01_propose -> 02_embed -> 02b_match_views ->
@@ -31,6 +32,7 @@ import json, os, glob, shutil, subprocess, sys, tempfile, threading, traceback, 
 from pathlib import Path
 
 import runpod
+from PIL import Image
 
 # ---- where the CEO's platform lives in the image (cloned by the Dockerfile) ----
 PLATFORM = os.environ.get("INFRASCAN_PLATFORM_DIR", "/app/pipeline")
@@ -79,6 +81,7 @@ STAGE_LABELS = {
     "00b_da3_streaming": "Estimating depth + camera poses",
     "pipeline.runner":  "Building floor plan + point cloud",
     "pano_clean":       "Removing capture operator",
+    "pano_lowres":      "Downsampling panoramas",
     "upload":           "Uploading scan to storage",
 }
 STAGE_ORDER = list(STAGE_LABELS)
@@ -344,7 +347,36 @@ def handler(job):
             print(f"[pano_clean] non-fatal failure, panoramas keep the operator: {e}",
                   flush=True)
 
-        # 5) upload the dataset to S3 under scans/<slug>/ (+ pano_clean/<slug>/).
+        # 4c) low-res panoramas (pano_lowres): the panorama-mode viewer streams these
+        #     equirect frames at native capture res (commonly 7680x3840, several MB
+        #     each) as a full-sphere texture -- heavy to pan/switch between. Downsample
+        #     to a size that still holds up under that mode's zoom range (2560 wide is
+        #     the balance point platform/pipeline/downsample_panoramas.py already uses
+        #     for the same purpose in infrascan-onprem). Built from pano_clean's output
+        #     when it produced frames (operator already removed, no point downsampling
+        #     the version we're about to throw away), falling back to the raw frames
+        #     otherwise. NON-FATAL for the same reason as pano_clean above.
+        pano_lowres_dir = data_dir / "pano_lowres" / "frames"
+        try:
+            _report(job, "pano_lowres")
+            lowres_src = pano_clean_dir if any(pano_clean_dir.glob("*.jpg")) else frames
+            lowres_width = int(os.environ.get("PANO_LOWRES_WIDTH", "2560"))
+            lowres_height = lowres_width // 2
+            lowres_quality = int(os.environ.get("PANO_LOWRES_QUALITY", "88"))
+            pano_lowres_dir.mkdir(parents=True, exist_ok=True)
+            lowres_files = sorted(lowres_src.glob("*.jpg"))
+            for p in lowres_files:
+                im = Image.open(p)
+                if im.size != (lowres_width, lowres_height):
+                    im = im.resize((lowres_width, lowres_height), Image.LANCZOS)
+                im.save(pano_lowres_dir / p.name, quality=lowres_quality)
+            stages_status["pano_lowres"] = "ok" if lowres_files else "skipped: no source frames"
+        except Exception as e:
+            stages_status["pano_lowres"] = f"skipped: {type(e).__name__}: {e}"
+            print(f"[pano_lowres] non-fatal failure, panorama mode keeps serving full-res: {e}",
+                  flush=True)
+
+        # 5) upload the dataset to S3 under scans/<slug>/ (+ pano_clean/<slug>/, pano_lowres/<slug>/).
         #    Layout the viewer expects:
         #      scans/<slug>/frames/*.jpg          (panoramas)
         #      scans/<slug>/views/*.jpg           (perspective; served as panos/ too)
@@ -420,6 +452,16 @@ def handler(job):
             if n_clean and (data_dir / "cameras.json").exists():
                 manifest.append((data_dir / "cameras.json", f"pano_clean/{slug}/cameras.json"))
 
+        # low-res panoramas (if the pano_lowres step produced them). Same layout as
+        # pano_clean, under its own prefix -- the viewer requests pano_lowres/<slug>/...
+        # first, falling back server-side to pano_clean/ then raw scans/ if absent.
+        n_lowres = 0
+        if pano_lowres_dir.is_dir():
+            for p in sorted(pano_lowres_dir.glob("*.jpg")):
+                manifest.append((p, f"pano_lowres/{slug}/frames/{p.name}")); n_lowres += 1
+            if n_lowres and (data_dir / "cameras.json").exists():
+                manifest.append((data_dir / "cameras.json", f"pano_lowres/{slug}/cameras.json"))
+
         nfiles = 0
         if storage_mode == "zip":
             import zipfile
@@ -449,7 +491,7 @@ def handler(job):
         return {
             "slug": slug, "scan_prefix": prefix + "/",
             "num_views": n_views, "num_panos": n_panos, "num_clean": n_clean,
-            "num_files": nfiles, "stages": stages_status,
+            "num_lowres": n_lowres, "num_files": nfiles, "stages": stages_status,
         }
     except Exception as e:
         return {
